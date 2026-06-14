@@ -1,0 +1,385 @@
+# Grimlock Architecture
+
+> Technical deep-dive into the eBPF + kTLS implementation
+
+## High-Level Overview
+
+Grimlock provides transparent mTLS encryption for A2A agent communication using:
+- **eBPF `cgroup/connect4`**: Intercepts outgoing connections at syscall level
+- **User-space daemon**: Manages TLS tunnels and certificate verification
+- **kTLS**: Kernel-level TLS encryption for efficiency
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                HOST A                                        │
+│                                                                              │
+│   ┌─────────────┐                                                            │
+│   │ Application │                                                            │
+│   │  (Agent)    │                                                            │
+│   └──────┬──────┘                                                            │
+│          │ connect(host_b:8080)                                              │
+│          ▼                                                                   │
+│   ┌──────────────────────────────────────────────────────────────────────┐  │
+│   │                         KERNEL                                        │  │
+│   │  ┌────────────────────────────────────────────────────────────────┐  │  │
+│   │  │                    eBPF Programs                                │  │  │
+│   │  │                                                                 │  │  │
+│   │  │  ┌─────────────────┐      ┌────────────────────────────────┐   │  │  │
+│   │  │  │ cgroup/connect4 │      │         sock_ops               │   │  │  │
+│   │  │  │                 │      │                                │   │  │  │
+│   │  │  │ Intercepts      │      │ Tracks socket lifecycle        │   │  │  │
+│   │  │  │ connect() calls │      │ Sends events to user-space     │   │  │  │
+│   │  │  │                 │      │                                │   │  │  │
+│   │  │  │ Redirects to    │      │                                │   │  │  │
+│   │  │  │ localhost:15001 │      │                                │   │  │  │
+│   │  │  └─────────────────┘      └────────────────────────────────┘   │  │  │
+│   │  └─────────────────────────────────────────────────────────────────┘  │  │
+│   └───────────────────────────────────────────────────────────────────────┘  │
+│          │                                                                   │
+│          │ Redirected to 127.0.0.1:15001                                    │
+│          ▼                                                                   │
+│   ┌──────────────────────────────────────────────────────────────────────┐  │
+│   │                    Grimlock Daemon (User Space)                       │  │
+│   │                                                                       │  │
+│   │  ┌───────────────┐  ┌───────────────┐  ┌────────────────────────┐   │  │
+│   │  │ Local Listener│  │ Tunnel Manager│  │ TLS + kTLS Setup      │   │  │
+│   │  │ (:15001)      │  │               │  │                        │   │  │
+│   │  │               │  │ Creates TLS   │  │ - mTLS handshake      │   │  │
+│   │  │ Accepts       │  │ connections   │  │ - Cert verification   │   │  │
+│   │  │ redirected    │  │ to peers      │  │ - HKDF key derivation │   │  │
+│   │  │ connections   │  │               │  │ - setsockopt(kTLS)    │   │  │
+│   │  └───────────────┘  └───────────────┘  └────────────────────────┘   │  │
+│   │                            │                                          │  │
+│   │                            │ TLS 1.3 tunnel (kTLS encrypts)          │  │
+│   │                            ▼                                          │  │
+│   │                    ┌───────────────┐                                  │  │
+│   │                    │ Tunnel Socket │                                  │  │
+│   │                    │ (port 9443)   │                                  │  │
+│   │                    └───────────────┘                                  │  │
+│   └───────────────────────────────────────────────────────────────────────┘  │
+│                                │                                             │
+└────────────────────────────────┼─────────────────────────────────────────────┘
+                                 │
+                    ═════════════════════════════
+                     mTLS Encrypted (TLS 1.3)
+                     AES-128-GCM via kTLS
+                    ═════════════════════════════
+                                 │
+┌────────────────────────────────┼─────────────────────────────────────────────┐
+│                                ▼                          HOST B             │
+│   ┌───────────────────────────────────────────────────────────────────────┐  │
+│   │                    Grimlock Daemon (User Space)                        │  │
+│   │                                                                        │  │
+│   │  ┌─────────────────┐  ┌────────────────────────────────────────────┐  │  │
+│   │  │ Tunnel Listener │  │ Forwarding Logic                           │  │  │
+│   │  │ (:9443)         │  │                                            │  │  │
+│   │  │                 │  │ 1. Accept TLS connection                   │  │  │
+│   │  │ Accepts mTLS    │  │ 2. Verify peer certificate                 │  │  │
+│   │  │ connections     │  │ 3. Read destination header                 │  │  │
+│   │  │                 │  │ 4. Connect to local agent                  │  │  │
+│   │  │                 │  │ 5. Forward bidirectionally                 │  │  │
+│   │  └─────────────────┘  └────────────────────────────────────────────┘  │  │
+│   └───────────────────────────────────────────────────────────────────────┘  │
+│          │                                                                   │
+│          │ Forward to 127.0.0.1:8080                                        │
+│          ▼                                                                   │
+│   ┌─────────────┐                                                            │
+│   │ Application │                                                            │
+│   │  (Agent B)  │                                                            │
+│   │  :8080      │                                                            │
+│   └─────────────┘                                                            │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Component Details
+
+### 1. eBPF Programs
+
+#### cgroup/connect4 (`grimlock_connect4`)
+- **Type**: `BPF_PROG_TYPE_CGROUP_SOCK_ADDR`
+- **Attach**: `BPF_CGROUP_INET4_CONNECT`
+- **Purpose**: Intercept outgoing connections and redirect to Grimlock
+
+```c
+SEC("cgroup/connect4")
+int grimlock_connect4(struct bpf_sock_addr *ctx) {
+    // Check if destination is a known agent peer
+    if (dst_port == AGENT_PORT && is_agent_peer(dst_ip)) {
+        // Redirect to local Grimlock listener
+        ctx->user_ip4 = LOCALHOST_IP;           // 127.0.0.1
+        ctx->user_port = bpf_htons(15001);      // Grimlock listener
+    }
+    return 1;  // Allow (with modified destination)
+}
+```
+
+#### sock_ops (`grimlock_sockops`)
+- **Type**: `BPF_PROG_TYPE_SOCK_OPS`
+- **Attach**: cgroup socket operations
+- **Purpose**: Track socket lifecycle, send events to user-space
+
+Key callbacks:
+- `BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB` - Outgoing connection established
+- `BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB` - Incoming connection accepted
+- `BPF_SOCK_OPS_STATE_CB` - Socket state changes (for cleanup)
+
+### 2. eBPF Maps
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         eBPF Maps                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  agent_peers (HASH)              config_map (ARRAY)             │
+│  ┌───────────────────┐           ┌───────────────────┐          │
+│  │ IP → 1 (known)    │           │ 0 → {enabled, ip} │          │
+│  │                   │           │                   │          │
+│  │ Populated from    │           │ Global config     │          │
+│  │ --peers flag      │           │                   │          │
+│  └───────────────────┘           └───────────────────┘          │
+│                                                                  │
+│  events (RINGBUF)                stats (ARRAY)                  │
+│  ┌───────────────────┐           ┌───────────────────┐          │
+│  │ Connection events │           │ Counters for      │          │
+│  │ → user-space      │           │ debugging         │          │
+│  └───────────────────┘           └───────────────────┘          │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 3. Grimlock Daemon (User Space - Go)
+
+#### Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| Main | `main.go` | eBPF loading, event processing, local listener |
+| Tunnel Manager | `tunnel.go` | TLS connection management, kTLS setup |
+| Crypto | `crypto.go` | HKDF key derivation for kTLS |
+
+#### Key Functions
+
+**Local Listener (`:15001`)**
+```go
+func handleLocalConnection(conn net.Conn) {
+    // 1. Accept redirected connection from agent
+    // 2. Create dedicated TLS tunnel to peer Grimlock
+    // 3. Send destination header (so peer knows where to forward)
+    // 4. Bidirectional forwarding: agent ↔ tunnel
+}
+```
+
+**Tunnel Listener (`:9443`)**
+```go
+func handleForwardingConnection(conn *tls.Conn, peerIP string) {
+    // 1. Read destination header (8 bytes: IP + port)
+    // 2. Connect to local agent at 127.0.0.1:port
+    // 3. Bidirectional forwarding: tunnel ↔ agent
+}
+```
+
+### 4. kTLS (Kernel TLS)
+
+kTLS offloads TLS record layer to kernel after user-space handshake:
+
+```go
+// After TLS 1.3 handshake completes:
+
+// 1. Derive symmetric keys using HKDF-Expand-Label
+clientKey, clientIV := deriveTrafficKeys(clientSecret)
+serverKey, serverIV := deriveTrafficKeys(serverSecret)
+
+// 2. Configure kTLS for transmit
+cryptoInfo := tls13CryptoInfo{
+    Version:    TLS_1_3_VERSION,
+    CipherType: TLS_CIPHER_AES_GCM_128,
+    Key:        key,
+    IV:         iv,
+    Salt:       salt,
+    RecSeq:     recordSequence,
+}
+syscall.SetsockoptString(fd, SOL_TLS, TLS_TX, cryptoInfo)
+
+// 3. Configure kTLS for receive
+syscall.SetsockoptString(fd, SOL_TLS, TLS_RX, cryptoInfo)
+```
+
+**Key Insight**: After kTLS is enabled, all `write()` calls on the socket are automatically encrypted by the kernel, and all `read()` calls return decrypted data.
+
+## Data Flow
+
+### Outgoing Request (Agent A → Agent B)
+
+```
+1. Agent A: curl http://<HOST_B_IP>:8080/a2a
+       │
+       ▼
+2. Kernel: connect(<HOST_B_IP>, 8080) syscall
+       │
+       ▼
+3. eBPF cgroup/connect4:
+   - Is <HOST_B_IP> in agent_peers map? YES
+   - Modify: connect(127.0.0.1, 15001)
+       │
+       ▼
+4. Connection established to localhost:15001
+       │
+       ▼
+5. Grimlock local listener accepts
+   - Create TLS tunnel to <HOST_B_IP>:9443
+   - TLS handshake (mTLS - verify certificates)
+   - Enable kTLS on tunnel socket
+   - Send destination header: [<HOST_B_IP>:8080]
+       │
+       ▼
+6. Agent A sends HTTP request
+       │
+       ▼
+7. Grimlock forwards through tunnel
+   - kTLS encrypts in kernel
+       │
+       ▼
+8. Encrypted data on wire to Host B:9443
+```
+
+### Incoming Request (Host B receives)
+
+```
+1. Encrypted TLS data arrives on :9443
+       │
+       ▼
+2. Grimlock tunnel listener accepts
+   - TLS handshake (verify peer certificate = agent-a)
+   - Read destination header: [<HOST_B_IP>:8080]
+       │
+       ▼
+3. Connect to local agent: 127.0.0.1:8080
+       │
+       ▼
+4. Forward decrypted HTTP request to agent
+       │
+       ▼
+5. Agent B processes request, sends response
+       │
+       ▼
+6. Response flows back through tunnel (encrypted)
+       │
+       ▼
+7. Agent A receives response (decrypted by kTLS)
+```
+
+## Protocol Format
+
+### Destination Header (8 bytes)
+
+Prepended to each tunneled connection:
+
+```
+┌─────────────────┬──────────────┬──────────────┐
+│ Destination IP  │ Dest Port    │ Reserved     │
+│ (4 bytes)       │ (2 bytes BE) │ (2 bytes)    │
+└─────────────────┴──────────────┴──────────────┘
+```
+
+This tells the receiving Grimlock where to forward the connection.
+
+## Security Model
+
+### Certificate Management
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Certificate Authority (CA)                    │
+│                                                                  │
+│                         ca.crt (public)                          │
+│                         ca.key (private, secured)                │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              │                             │
+              ▼                             ▼
+┌─────────────────────────┐   ┌─────────────────────────┐
+│   Agent A Certificate   │   │   Agent B Certificate   │
+│                         │   │                         │
+│ CN: agent-a             │   │ CN: agent-b             │
+│ SAN: <HOST_A_IP>     │   │ SAN: <HOST_B_IP>      │
+│                         │   │                         │
+│ agent-a.crt (public)    │   │ agent-b.crt (public)    │
+│ agent-a.pem (private)   │   │ agent-b.pem (private)   │
+└─────────────────────────┘   └─────────────────────────┘
+```
+
+### Identity Verification
+
+- Both Grimlocks present certificates during TLS handshake
+- Certificates validated against shared CA
+- Certificate CN logged for audit trail
+- Invalid certificates → connection rejected
+
+### Trust Model
+
+- **POC**: Pre-shared certificates with common CA
+- **Future**: Could extend to SPIFFE/SPIRE for dynamic identity
+
+## Key Technical Discoveries
+
+### 1. sk_msg Bypasses kTLS
+
+**Finding**: `BPF_PROG_TYPE_SK_MSG` with `bpf_msg_redirect_hash()` operates at the TCP buffer level, completely bypassing the kTLS ULP (Upper Layer Protocol) hooks.
+
+**Impact**: Data redirected via sk_msg is sent unencrypted even if kTLS is enabled on the target socket.
+
+**Solution**: Use `cgroup/connect4` for connection interception + user-space forwarding with standard `Write()` calls, which properly trigger kTLS encryption.
+
+### 2. kTLS Key Derivation
+
+Go's `crypto/tls` doesn't expose symmetric keys. We implemented TLS 1.3 HKDF-Expand-Label:
+
+```go
+func hkdfExpandLabel(secret []byte, label string, context []byte, length int) []byte {
+    // TLS 1.3 key derivation
+    hkdfLabel := buildHKDFLabel(label, context, length)
+    return hkdf.Expand(sha256.New, secret, hkdfLabel, length)
+}
+
+func deriveTrafficKeys(trafficSecret []byte) (key, iv []byte) {
+    key = hkdfExpandLabel(trafficSecret, "key", nil, 16)  // AES-128
+    iv = hkdfExpandLabel(trafficSecret, "iv", nil, 12)    // GCM nonce
+    return
+}
+```
+
+### 3. SSH Protection Critical
+
+eBPF programs attached to root cgroup affect ALL connections, including SSH. Always exclude port 22:
+
+```c
+// CRITICAL: Never touch SSH traffic
+if (dst_port == SSH_PORT || src_port == SSH_PORT)
+    return 1;  // Allow without modification
+```
+
+## Performance Considerations
+
+| Aspect | Impact | Notes |
+|--------|--------|-------|
+| First connection | Higher latency | TLS handshake required |
+| Subsequent data | Low overhead | kTLS in kernel |
+| Memory | Moderate | eBPF maps + tunnel connections |
+| CPU | Low | Hardware AES acceleration |
+
+## Limitations (POC)
+
+1. **Single peer configuration**: Uses first `--peers` entry for all redirects
+2. **IPv4 only**: No IPv6 support yet
+3. **TCP only**: No UDP/QUIC
+4. **Per-request tunnels**: No connection pooling (creates new TLS connection per request)
+
+## Future Enhancements
+
+1. **Multi-peer routing**: Use eBPF map to track original destination per connection
+2. **Connection pooling**: Reuse TLS tunnels with proper multiplexing
+3. **SPIFFE integration**: Dynamic identity with workload attestation
+4. **Policy engine**: Allow/deny rules based on agent identity
+5. **Metrics/Observability**: Prometheus metrics, distributed tracing
