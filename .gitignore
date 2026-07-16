@@ -1,0 +1,7 @@
+# The MCP Python SDK fork lives here as its own independent git repository
+# (it carries its own history and upstream remote). Do not embed it as a
+# gitlink/submodule in this repo.
+/python-sdk/
+
+# The NDSS paper draft is kept out of the code repository.
+/grimlock/paper/

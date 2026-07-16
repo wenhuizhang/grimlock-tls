@@ -1,0 +1,109 @@
+theory GrimlockResumption
+/*
+  Attestation-resumption handshake — machine-checked model of
+  grimlock/internal/attest `gate.Resume`.
+
+  After a full attestation gate, two honest parties share a resumption secret RS
+  (derived from that session's exporter). On a LATER TLS session they prove
+  continuity of the attested identity by exchanging directional MACs keyed by RS
+  and bound to the *fresh* session's exporter value (the "bind"):
+
+      client tag = MAC(RS, "client" || bind)
+      server tag = MAC(RS, "server" || bind)
+
+  We model MAC(k,m) as h(<k,m>): computable only by a party that knows k. The
+  adversary controls the network (Dolev-Yao), may learn any session bind (a
+  cuckoo/MITM who terminates TLS with an honest party), and may compromise RS.
+
+  Proved:
+    - executable       : the handshake completes on an honest run (non-vacuous).
+    - resume_agreement : if a client accepts a resume with bind b to S, then S
+                         actually accepted with the SAME b — unless RS was
+                         compromised. Agreement on b IS relay/cuckoo resistance
+                         (a tag from one session cannot be accepted on another),
+                         and holds even though the adversary may reveal every bind
+                         (knowing the session EKM does not help without RS).
+    - rs_secret        : RS stays secret unless explicitly compromised.
+*/
+
+begin
+
+builtins: hashing
+
+// A prior full gate distributes the resumption secret RS to two honest parties.
+rule Setup_RS:
+    [ Fr(~rs) ]
+  --[ SetupRS($C, $S, ~rs) ]->
+    [ !Rs($C, $S, ~rs), !Rs($S, $C, ~rs) ]
+
+// A TLS session gives its two endpoints a fresh, shared exporter value (bind),
+// with roles FIXED by the connection: the dialer is the client, the listener the
+// server (the directional 'client'/'server' tag labels rely on this). The role
+// facts are SINGLE-USE — one resume handshake per session — which, with the fresh
+// per-session bind, is what makes agreement injective (no replay). A persistent
+// copy lets the adversary reveal the exporter (a MITM knows its own leg's EKM).
+rule New_Session:
+    [ Fr(~b) ]
+  --[ NewSession($C, $S, ~b) ]->
+    [ BindClient($C, $S, ~b), BindServer($S, $C, ~b), !BindKnown(~b) ]
+
+// Adversary may learn a session bind (a MITM/cuckoo terminating TLS with a peer).
+rule Reveal_Bind:
+    [ !BindKnown(~b) ]
+  --[ RevealBind(~b) ]->
+    [ Out(~b) ]
+
+// Adversary may compromise a resumption secret (trust failure / key theft).
+// Keyed by the secret itself so it is captured regardless of party ordering.
+rule Reveal_RS:
+    [ !Rs($C, $S, ~rs) ]
+  --[ RevealRS(~rs) ]->
+    [ Out(~rs) ]
+
+// Client resumes: emit the client tag, await the server tag — both bound to b.
+rule Client_Start:
+    [ !Rs($C, $S, ~rs), BindClient($C, $S, ~b) ]
+  --[ ClientStart($C, $S, ~b) ]->
+    [ Out(h(<~rs, 'client', ~b>)), St_Client($C, $S, ~rs, ~b) ]
+
+// Server accepts a well-formed client tag and replies with the server tag.
+rule Server_Accept:
+    [ !Rs($S, $C, ~rs), BindServer($S, $C, ~b), In(h(<~rs, 'client', ~b>)) ]
+  --[ ServerAccept($S, $C, ~rs, ~b) ]->
+    [ Out(h(<~rs, 'server', ~b>)) ]
+
+// Client finishes iff it receives the matching server tag on the same bind.
+rule Client_Finish:
+    [ St_Client($C, $S, ~rs, ~b), In(h(<~rs, 'server', ~b>)) ]
+  --[ ClientAccept($C, $S, ~rs, ~b) ]->
+    [ ]
+
+lemma executable:
+  exists-trace
+  "Ex C S rs b #i #j. ServerAccept(S, C, rs, b) @ i & ClientAccept(C, S, rs, b) @ j"
+
+lemma resume_agreement:
+  all-traces
+  "All C S rs b #i.
+     ClientAccept(C, S, rs, b) @ i
+     ==> ( (Ex #j. ServerAccept(S, C, rs, b) @ j & #j < #i)
+         | (Ex #r. RevealRS(rs) @ r) )"
+
+// Injective agreement (no replay): each client acceptance corresponds to a
+// UNIQUE server run on the same (rs, bind) — a captured tag cannot drive two
+// acceptances. The fresh per-session bind is what makes this hold.
+lemma resume_injective:
+  all-traces
+  "All C S rs b #i.
+     ClientAccept(C, S, rs, b) @ i
+     ==> ( (Ex #j. ServerAccept(S, C, rs, b) @ j & #j < #i
+              & not (Ex C2 S2 #i2. ClientAccept(C2, S2, rs, b) @ i2 & not (#i2 = #i)))
+         | (Ex #r. RevealRS(rs) @ r) )"
+
+lemma rs_secret:
+  all-traces
+  "All C S rs #i.
+     SetupRS(C, S, rs) @ i & (not (Ex #r. RevealRS(rs) @ r))
+     ==> not (Ex #k. K(rs) @ k)"
+
+end

@@ -129,28 +129,38 @@ curl http://<host-b-ip>:8080/.well-known/agent.json
 ai-grimlock/
 ├── cmd/
 │   └── grimlock/           # Main Grimlock daemon
-│       ├── main.go         # Entry point, eBPF loading
-│       ├── tunnel.go       # TLS tunnel management
+│       ├── main.go         # Entry point, eBPF loading, forward path
+│       ├── tunnel.go       # kTLS tunnel manager, attestation gate + resumption
+│       ├── pool.go         # Per-peer warm pool of dedicated tunnels
+│       ├── dataplane.go    # Zero-copy splice(2) data plane
+│       ├── payment.go      # x402 payment enforcement
+│       ├── receipt.go      # Tamper-evident payment receipt log
+│       ├── origdest.go     # Multi-peer original-destination recovery
+│       ├── hardening.go    # Process hardening (no_new_privs)
 │       └── crypto.go       # kTLS key derivation
 ├── src/bpf/
-│   └── grimlock.bpf.c      # eBPF programs (sock_ops, connect4)
+│   └── grimlock.bpf.c      # eBPF programs (connect4 redirect + sockops bridge)
+├── internal/
+│   ├── attest/             # TDX remote attestation + post-handshake gate
+│   ├── x402/               # x402 payment types, policy, binding
+│   ├── capability/         # MCP capability/scope governance
+│   └── mcpmanifest/        # MCP manifest auto-pull
 ├── demo/
 │   └── a2a-agent/          # Demo A2A agent for testing
-├── docs/
-│   ├── POC-PLAN.md         # Detailed implementation plan
-│   ├── DEMO-GUIDE.md       # Testing and demo guide
-│   └── LESSONS-LEARNED.md  # Technical discoveries
+├── docs/                   # architecture, attestation, x402, mcp, lessons
 ├── certs/                  # Certificates (not in git)
-└── scripts/
-    └── generate-certs.sh   # PKI generation
+└── scripts/                # PKI generation + host setup
 ```
 
 ## Documentation
 
+- [Architecture](docs/architecture.md) - eBPF + kTLS technical deep-dive
+- [Attestation](docs/attestation.md) - TDX remote attestation operations
+- [Attestation Design](docs/attestation-design.md) - post-handshake gate design + theory
+- [x402 Payments](docs/x402-attested-payments.md) - attested payment enforcement
+- [MCP Capability Tunnel](docs/mcp-capability-tunnel.md) - capability governance
 - [Demo Guide](docs/DEMO-GUIDE.md) - How to test and demo
-- [POC Plan](docs/POC-PLAN.md) - Detailed design and implementation plan
 - [Lessons Learned](docs/LESSONS-LEARNED.md) - Technical discoveries during development
-- [Architecture](docs/architecture.md) - Technical deep-dive
 
 ## Test Infrastructure
 

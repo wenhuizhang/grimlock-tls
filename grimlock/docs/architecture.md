@@ -371,15 +371,79 @@ if (dst_port == SSH_PORT || src_port == SSH_PORT)
 
 ## Limitations (POC)
 
-1. **Single peer configuration**: Uses first `--peers` entry for all redirects
-2. **IPv4 only**: No IPv6 support yet
-3. **TCP only**: No UDP/QUIC
-4. **Per-request tunnels**: No connection pooling (creates new TLS connection per request)
+1. **IPv4 only**: No IPv6 support yet
+2. **TCP only**: No UDP/QUIC
+
+## Implemented
+
+- **Multi-peer routing**: `connect4` records the original destination by socket
+  cookie; `sock_ops` re-keys it to the agent's ephemeral source port
+  (`port_dest` map); user-space resolves it on the accepted connection and routes
+  to the correct peer (`origdest.go`, `channelFor`).
+- **Multi-port interception**: `connect4` filters on the `agent_ports` map
+  instead of a single hard-coded port, so one agent host can expose several
+  services. Populated from `--agent-ports` (default `8080`); the original port
+  is preserved in `orig_dest.port` and carried through to the peer-side dial.
+- **Per-peer channel** (`channelFor(peer).stream`, `pool.go`): a warm pool of
+  **dedicated 1:1 kTLS tunnels** — no multiplexer. The quote is amortized by
+  **attestation resumption** (`tunnel.go`): the first connection full-gates and
+  caches a resumption secret; subsequent ones do a cheap HMAC resume (`gate.Resume`)
+  within the secret's TTL, else full-gate again. Independent connections ⇒ no
+  head-of-line blocking; each splices.
+- **Channel classes — fast vs. guarded, per connection** (`guard.go`,
+  [channel-classes.md](channel-classes.md)): each connection is classified from its
+  recovered dest port. A **fast** channel splices (kTLS zero-copy, daemon off-path)
+  — for bulk. A **guarded** channel runs a userspace **enforcer pipeline** — for
+  control (tool calls, payments). A **deny** channel is refused (egress chokepoint).
+  Enforcement needs plaintext, so guarded ⇒ no splice is fundamental; routing each
+  channel to its lane lets both coexist instead of the old daemon-global either/or.
+  `--guard 8080:mcp,x402` composes both enforcers on one channel — a request
+  forwards only if every enforcer permits it (the model's `⊢ Forward`).
+- **Wire-level MCP capability enforcement** (`mcp.go`): as a guarded-pipeline
+  member it parses the agent's MCP/JSON-RPC and blocks any `tools/call` for a tool
+  not in the peer's **attested** manifest, or whose capability exceeds the grant —
+  out-of-agent, on the unbypassable path. Handles JSON-RPC batches and fails closed
+  on unparseable bodies. The gate binds the manifest digest; the wire enforces each
+  call against it, so capability governance trusts neither endpoint's SDK. Uses the
+  same `capCovers` lattice the Coq proofs (`covered_*`) are about.
+- **x402 payment enforcement** (`payment.go`): the other pipeline member — blocks
+  out-of-policy payments and binds each allowed one to a TDX quote (session EKM +
+  epoch). Its `paymentConn` owns the response direction too (402/settlement sniff).
+- **Process hardening** (`hardening.go`, `seccomp.go`): `no_new_privs`,
+  **non-dumpable** (a co-located hijacked neighbor cannot ptrace / read
+  `/proc/<pid>/mem` to steal kTLS or resumption secrets, and no core dump leaks
+  them), and an opt-in **seccomp deny-list** (`--seccomp`) blocking dangerous
+  syscalls (ptrace, `process_vm_*`, module load, mount, namespace ops) — verified
+  to actually block `ptrace`. Full allow-list separation is designed in
+  [privilege-separation.md](privilege-separation.md).
+- **Robustness / anti-DoS** (`tunnel.go`): inbound setups are concurrency-capped
+  and **load-shed** past `maxConcurrentSetups`, and every setup (dial, TLS
+  handshake, gate/resume, header) is **deadline-bound** so a stalled/slowloris
+  peer can't wedge a goroutine; the data phase is unbounded. A per-peer **circuit
+  breaker** (`pool.go`) suppresses reconnect storms to a down peer. Concurrent
+  tunnel establishes use a **per-tunnel keyLog** (a shared one would corrupt kTLS
+  key derivation under warm-pool concurrency).
+- **Observability** (`metrics.go`): lock-free counters (full gates, resumes,
+  attest failures, load-shed, requests/bytes forwarded, payments allowed/blocked)
+  exposed via expvar at `/debug/vars` when `--metrics-addr` is set.
+- **Validated on a real kernel** (no TDX — see [validation.md](validation.md)):
+  eBPF verifier load + `connect4`/`sock_ops` attach, the connect4 **redirect**
+  (a dial to an unreachable peer lands on the local proxy), **kTLS engaged**
+  (kernel crypto), and **`splice()` zero-copy** (strace-confirmed). The full
+  datapath runs end-to-end (CA mode + warm-pool concurrency), and the attested
+  **resumption** protocol (full-gate → cache → cheap resume, same epoch) runs over
+  **real kTLS** — only the quote content is stubbed (that alone needs a TD).
+
+## Formal & design references
+
+- [model.md](model.md) — the authorization model · [semantics-categorical.md](semantics-categorical.md) — categorical semantics
+- [threat-model.md](threat-model.md) · [multi-hop.md](multi-hop.md) · [privilege-separation.md](privilege-separation.md)
+- [`../formal/`](../formal/) — machine-checked (Coq) capability + transcript proofs
 
 ## Future Enhancements
 
-1. **Multi-peer routing**: Use eBPF map to track original destination per connection
-2. **Connection pooling**: Reuse TLS tunnels with proper multiplexing
-3. **SPIFFE integration**: Dynamic identity with workload attestation
-4. **Policy engine**: Allow/deny rules based on agent identity
-5. **Metrics/Observability**: Prometheus metrics, distributed tracing
+1. **SPIFFE integration**: Dynamic identity with workload attestation
+2. **Policy engine**: Allow/deny rules based on agent identity
+3. **Metrics/Observability**: expvar counters shipped (`--metrics-addr`); a
+   Prometheus exporter + distributed tracing would extend it
+4. **Per-source-IP rate limiting** on gate setups (complements the load-shed cap)

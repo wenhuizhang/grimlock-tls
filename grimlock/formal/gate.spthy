@@ -1,0 +1,96 @@
+theory GrimlockGate
+/*
+  Full attestation gate — machine-checked model of grimlock/internal/attest
+  `gate.Run`: mutual quote exchange bound to the TLS exporter (EKM), THEN a mutual
+  ACK barrier.
+
+  A quote is a signature by the TD's attestation key over <'quote', ekm>; a party
+  accepts a peer quote only if it verifies under a trusted peer key AND is bound to
+  ITS session's ekm. After accepting, a party signs an ACK over <'ack', ekm>; it
+  only *forwards* (emits application data) once it has verified the PEER's ACK too.
+  The EKM is shared solely by the two honest endpoints of a session.
+
+  Proved:
+    - executable    : a full mutual gate completes on both sides (non-vacuous).
+    - gate_binding  : accepting a peer quote on ekm implies the peer quoted for that
+                      SAME ekm (unless its key is stolen) — relay/cuckoo resistance
+                      (a quote from another session is never accepted).
+    - mutual_barrier: a party forwards only if the PEER also accepted it (the peer
+                      reached GateOK on the same ekm) — the honest-risk "both-or-
+                      neither" property: neither side emits data on a peer it, or
+                      that, rejected. Unless the peer's key is stolen.
+*/
+
+begin
+
+builtins: signing
+
+rule TD_Setup:
+    [ Fr(~ltk) ]
+  --[ HonestTD($A) ]->
+    [ !Ltk($A, ~ltk), !Pk($A, pk(~ltk)), Out(pk(~ltk)) ]
+
+rule Session:
+    [ Fr(~e) ]
+  --[ Sess($A, $B, ~e) ]->
+    [ !Ekm($A, $B, ~e), !Ekm($B, $A, ~e) ]
+
+rule Reveal_Ekm:
+    [ !Ekm($A, $B, ~e) ]
+  --[ RevEkm(~e) ]->
+    [ Out(~e) ]
+
+rule Reveal_Ltk:
+    [ !Ltk($A, ~ltk) ]
+  --[ RevLtk($A) ]->
+    [ Out(~ltk) ]
+
+// Emit a quote bound to this session's exporter.
+rule Quote:
+    [ !Ltk($A, ~ltk), !Ekm($A, $B, ~e) ]
+  --[ Quoted($A, ~e) ]->
+    [ Out(sign(<'quote', ~e>, ~ltk)) ]
+
+// Accept a peer quote: verifies under the peer's trusted key and is bound to ekm.
+rule GateOK:
+    [ !Ekm($A, $B, ~e), !Pk($B, pkB), In(q) ]
+  --[ GateOK($A, $B, ~e), Verified(verify(q, <'quote', ~e>, pkB)) ]->
+    [ !AcceptedPeer($A, $B, ~e) ]
+
+// Having accepted the peer, announce our ACK (signed, bound to ekm).
+rule Ack:
+    [ !Ltk($A, ~ltk), !AcceptedPeer($A, $B, ~e) ]
+  --[ Acked($A, $B, ~e) ]->
+    [ Out(sign(<'ack', ~e>, ~ltk)) ]
+
+// Forward (emit data) only after accepting the peer AND verifying the peer's ACK.
+rule Forward:
+    [ !AcceptedPeer($A, $B, ~e), !Pk($B, pkB), In(ackSig) ]
+  --[ Forward($A, $B, ~e), VerifiedAck(verify(ackSig, <'ack', ~e>, pkB)) ]->
+    [ ]
+
+restriction verified_true:
+  "All x #i. Verified(x) @ i ==> x = true"
+
+restriction verified_ack_true:
+  "All x #i. VerifiedAck(x) @ i ==> x = true"
+
+lemma executable:
+  exists-trace
+  "Ex A B e #i #j. Forward(A, B, e) @ i & Forward(B, A, e) @ j"
+
+lemma gate_binding:
+  all-traces
+  "All A B e #i.
+     GateOK(A, B, e) @ i
+     ==> ( (Ex #j. Quoted(B, e) @ j & #j < #i)
+         | (Ex #r. RevLtk(B) @ r) )"
+
+lemma mutual_barrier:
+  all-traces
+  "All A B e #i.
+     Forward(A, B, e) @ i
+     ==> ( (Ex #j. GateOK(B, A, e) @ j)
+         | (Ex #r. RevLtk(B) @ r) )"
+
+end
