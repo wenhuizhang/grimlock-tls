@@ -50,16 +50,6 @@ char LICENSE[] SEC("license") = "Dual MIT/GPL";
 #define EVENT_ACCEPT  2
 #define EVENT_CLOSE   3
 
-// Statistics indices
-#define STAT_SOCKOPS_ESTABLISHED 0
-#define STAT_SOCKOPS_CLOSE       1
-#define STAT_PARSER_CALLS        2
-#define STAT_VERDICT_CALLS       3
-#define STAT_REDIRECT_OK         4
-#define STAT_REDIRECT_FAIL       5
-#define STAT_PASS                6
-#define STAT_SOCKMAP_ADD         7
-
 // Event structure sent to user-space via ring buffer
 struct event {
     __u64 timestamp_ns;
@@ -87,6 +77,17 @@ struct {
     __type(value, __u8);
 } agent_peers SEC(".maps");
 
+// Set of agent destination ports to intercept (populated by user-space).
+// Lets connect4 redirect more than the single legacy AGENT_PORT so one agent
+// host can expose several services. Always holds at least AGENT_PORT.
+// Key: destination port (host byte order, widened to __u32), Value: 1.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 64);
+    __type(key, __u32);
+    __type(value, __u8);
+} agent_ports SEC(".maps");
+
 // Configuration from user-space
 struct config {
     __u32 enabled;
@@ -101,45 +102,48 @@ struct {
 } config_map SEC(".maps");
 
 // =============================================================================
-// Phase 4: Data Redirect Maps
+// Multi-peer: original-destination recovery
 // =============================================================================
+// connect4 rewrites the destination to 127.0.0.1:15001, losing which peer the
+// agent dialed. To recover it per-connection for multi-peer routing we bridge:
+//   connect4 (knows orig dest, not yet the source port): cookie -> orig_dest
+//   sock_ops ESTABLISHED (knows cookie AND the bound source port): re-key to
+//                                                  src_port -> orig_dest
+//   user-space (sees the accepted conn's remote/source port): looks up port_dest
 
-// Sockmap: stores sockets by local port for sk_skb redirect
-// Key: local port, Value: socket
+// The peer the agent originally dialed.
+struct orig_dest {
+    __u32 ip;    // network byte order (as in ctx->user_ip4)
+    __u16 port;  // host byte order
+    __u16 _pad;
+};
+
+// connect4 -> sock_ops bridge, keyed by socket cookie (LRU self-evicts strays).
 struct {
-    __uint(type, BPF_MAP_TYPE_SOCKHASH);
-    __uint(max_entries, 1024);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u64);
+    __type(value, struct orig_dest);
+} cookie_dest SEC(".maps");
+
+// User-space lookup table, keyed by the agent's ephemeral source port.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
     __type(key, __u32);
-    __type(value, __u64);
-} sock_map SEC(".maps");
-
-// Redirect configuration: source port -> target port
-// When data arrives on source port socket, redirect to target port socket
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024);
-    __type(key, __u32);   // source local port
-    __type(value, __u32); // target local port (key in sock_map)
-} redirect_map SEC(".maps");
-
-// Statistics for debugging
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 16);
-    __type(key, __u32);
-    __type(value, __u64);
-} stats SEC(".maps");
-
-// Helper: increment stat counter
-static __always_inline void inc_stat(__u32 idx) {
-    __u64 *val = bpf_map_lookup_elem(&stats, &idx);
-    if (val)
-        __sync_fetch_and_add(val, 1);
-}
+    __type(value, struct orig_dest);
+} port_dest SEC(".maps");
 
 // Helper: Check if IP is a known agent peer
 static __always_inline bool is_agent_peer(__u32 ip) {
     __u8 *val = bpf_map_lookup_elem(&agent_peers, &ip);
+    return val != NULL && *val == 1;
+}
+
+// Helper: Check if a destination port is an intercepted agent port.
+static __always_inline bool is_agent_port(__u16 port) {
+    __u32 key = port;
+    __u8 *val = bpf_map_lookup_elem(&agent_ports, &key);
     return val != NULL && *val == 1;
 }
 
@@ -169,25 +173,23 @@ static __always_inline void send_event(__u8 type, __u32 src_ip, __u32 dst_ip,
     bpf_ringbuf_submit(evt, 0);
 }
 
-// sock_ops program - intercepts socket operations
-// This adds sockets to sockmap for sk_skb redirect
+// sock_ops program - emits connection lifecycle events to user-space for
+// observability of A2A peer connections (CONNECT/ACCEPT/CLOSE).
 SEC("sockops")
 int grimlock_sockops(struct bpf_sock_ops *skops) {
     struct config *cfg;
     __u32 src_ip, dst_ip;
     __u16 src_port, dst_port;
-    __u32 local_port;
-    int ret;
-    
+
     // Only handle IPv4 TCP
     if (skops->family != AF_INET)
         return 0;
-    
+
     // Get configuration
     cfg = get_config();
     if (!cfg || !cfg->enabled)
         return 0;
-    
+
     // Extract connection info
     src_ip = skops->local_ip4;
     dst_ip = skops->remote_ip4;
@@ -195,182 +197,55 @@ int grimlock_sockops(struct bpf_sock_ops *skops) {
     src_port = skops->local_port;
     // remote_port has port in upper 16 bits, in network byte order
     dst_port = bpf_ntohs(skops->remote_port >> 16);
-    
+
     // CRITICAL: Never touch SSH traffic - prevents lockout!
     if (src_port == SSH_PORT || dst_port == SSH_PORT)
         return 0;
-    
+
     switch (skops->op) {
     case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB:
-        inc_stat(STAT_SOCKOPS_ESTABLISHED);
-        
-        // Add socket to sockmap for potential redirect
-        local_port = skops->local_port;
-        ret = bpf_sock_hash_update(skops, &sock_map, &local_port, BPF_ANY);
-        if (ret == 0) {
-            inc_stat(STAT_SOCKMAP_ADD);
-        }
-        
-        // Outgoing connection established
-        // Check if destination is a known agent peer AND port is 8080
-        if (dst_port == AGENT_PORT && is_agent_peer(dst_ip)) {
-            send_event(EVENT_CONNECT, src_ip, dst_ip, src_port, dst_port);
-            // Enable state change callbacks for cleanup
-            bpf_sock_ops_cb_flags_set(skops, BPF_SOCK_OPS_STATE_CB_FLAG);
+        // Multi-peer: bridge the original destination recorded by connect4 from
+        // the socket cookie to the now-bound ephemeral source port, where
+        // user-space looks it up on the accepted local connection. (By this point
+        // the destination is the rewritten 127.0.0.1:15001, so we key on cookie.)
+        {
+            __u64 cookie = bpf_get_socket_cookie(skops);
+            struct orig_dest *od = bpf_map_lookup_elem(&cookie_dest, &cookie);
+            if (od) {
+                __u32 sport = skops->local_port;
+                bpf_map_update_elem(&port_dest, &sport, od, BPF_ANY);
+                bpf_map_delete_elem(&cookie_dest, &cookie);
+                bpf_sock_ops_cb_flags_set(skops, BPF_SOCK_OPS_STATE_CB_FLAG);
+            }
         }
         break;
-        
+
     case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB:
-        inc_stat(STAT_SOCKOPS_ESTABLISHED);
-        
-        // Add socket to sockmap for potential redirect
-        local_port = skops->local_port;
-        ret = bpf_sock_hash_update(skops, &sock_map, &local_port, BPF_ANY);
-        if (ret == 0) {
-            inc_stat(STAT_SOCKMAP_ADD);
-        }
-        
-        // Incoming connection established
-        // Check if source is a known agent peer AND our port is 8080
-        if (src_port == AGENT_PORT && is_agent_peer(src_ip)) {
+        // Incoming connection from a known agent peer.
+        if (is_agent_port(src_port) && is_agent_peer(src_ip)) {
             send_event(EVENT_ACCEPT, dst_ip, src_ip, dst_port, src_port);
             bpf_sock_ops_cb_flags_set(skops, BPF_SOCK_OPS_STATE_CB_FLAG);
         }
         break;
-        
+
     case BPF_SOCK_OPS_STATE_CB:
-        // Socket state change - track closes
         if (skops->args[1] == BPF_TCP_CLOSE) {
-            inc_stat(STAT_SOCKOPS_CLOSE);
-            
-            // Clean up sockmap entry
-            local_port = skops->local_port;
-            bpf_map_delete_elem(&sock_map, &local_port);
-            bpf_map_delete_elem(&redirect_map, &local_port);
-            
-            // Only send close event if it was a tracked connection
-            if ((dst_port == AGENT_PORT && is_agent_peer(dst_ip)) ||
-                (src_port == AGENT_PORT && is_agent_peer(src_ip))) {
+            __u32 sport = skops->local_port;
+            bpf_map_delete_elem(&port_dest, &sport); // free the orig-dest entry
+            if ((is_agent_port(dst_port) && is_agent_peer(dst_ip)) ||
+                (is_agent_port(src_port) && is_agent_peer(src_ip))) {
                 send_event(EVENT_CLOSE, src_ip, dst_ip, src_port, dst_port);
             }
         }
         break;
     }
-    
+
     return 0;
-}
-
-// =============================================================================
-// sk_skb programs for data redirect
-// =============================================================================
-
-// Stream parser: determine message boundary
-// For our use case, treat entire buffer as one message
-SEC("sk_skb/stream_parser")
-int grimlock_stream_parser(struct __sk_buff *skb) {
-    inc_stat(STAT_PARSER_CALLS);
-    return skb->len;
-}
-
-// Stream verdict: decide where to redirect data
-SEC("sk_skb/stream_verdict")
-int grimlock_stream_verdict(struct __sk_buff *skb) {
-    __u32 src_port = skb->local_port;
-    __u32 remote_port = skb->remote_port >> 16;  // Upper 16 bits
-    __u32 *target_port;
-    long ret;
-    
-    inc_stat(STAT_VERDICT_CALLS);
-    
-    // CRITICAL: Never redirect SSH traffic
-    if (src_port == SSH_PORT || remote_port == SSH_PORT) {
-        inc_stat(STAT_PASS);
-        return SK_PASS;
-    }
-    
-    // Check if this port has a redirect configured
-    target_port = bpf_map_lookup_elem(&redirect_map, &src_port);
-    if (!target_port) {
-        inc_stat(STAT_PASS);
-        return SK_PASS;
-    }
-    
-    // Redirect to target socket
-    ret = bpf_sk_redirect_hash(skb, &sock_map, target_port, BPF_F_INGRESS);
-    if (ret == SK_PASS) {
-        inc_stat(STAT_REDIRECT_OK);
-    } else {
-        inc_stat(STAT_REDIRECT_FAIL);
-    }
-    
-    return ret;
-}
-
-// =============================================================================
-// sk_msg program for sender-side redirect (outgoing data)
-// =============================================================================
-
-#define STAT_MSG_CALLS      8
-#define STAT_MSG_REDIRECT   9
-
-// Message redirect: intercept sendmsg/write and redirect to tunnel
-// NOTE: This is kept for reference but we now use cgroup/connect4 + user-space forwarding
-SEC("sk_msg")
-int grimlock_msg_redirect(struct sk_msg_md *msg) {
-    __u32 local_port = msg->local_port;
-    __u32 remote_port = msg->remote_port >> 16;
-    __u32 *target_port;
-    long ret;
-    
-    inc_stat(STAT_MSG_CALLS);
-    
-    // CRITICAL: Never redirect SSH traffic
-    if (local_port == SSH_PORT || remote_port == SSH_PORT) {
-        return SK_PASS;
-    }
-    
-    // Check if this socket has a redirect configured
-    target_port = bpf_map_lookup_elem(&redirect_map, &local_port);
-    if (!target_port) {
-        return SK_PASS;
-    }
-    
-    // Redirect outgoing message to target socket (tunnel)
-    ret = bpf_msg_redirect_hash(msg, &sock_map, target_port, 0);
-    if (ret == SK_PASS) {
-        inc_stat(STAT_MSG_REDIRECT);
-    }
-    
-    return ret;
 }
 
 // =============================================================================
 // cgroup/connect4 - Intercept and redirect outgoing connections
 // =============================================================================
-
-#define STAT_CONNECT4_CALLS    10
-#define STAT_CONNECT4_REDIRECT 11
-
-// Store original destination for later retrieval by user-space
-// Key: (local_ip, local_port) after redirect, Value: original (dst_ip, dst_port)
-struct orig_dest {
-    __u32 ip;
-    __u16 port;
-    __u16 padding;
-};
-
-struct orig_dest_key {
-    __u32 src_ip;
-    __u16 src_port;
-    __u16 padding;
-};
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024);
-    __type(key, struct orig_dest_key);
-    __type(value, struct orig_dest);
-} orig_dest_map SEC(".maps");
 
 // cgroup/connect4: Intercept connect() calls and redirect to Grimlock
 SEC("cgroup/connect4")
@@ -378,9 +253,7 @@ int grimlock_connect4(struct bpf_sock_addr *ctx) {
     struct config *cfg;
     __u32 dst_ip;
     __u16 dst_port;
-    
-    inc_stat(STAT_CONNECT4_CALLS);
-    
+
     // Only handle IPv4 TCP
     if (ctx->family != AF_INET)
         return 1;  // Allow
@@ -402,37 +275,22 @@ int grimlock_connect4(struct bpf_sock_addr *ctx) {
     if (dst_ip == LOCALHOST_IP)
         return 1;  // Allow
     
-    // Only redirect connections to known agent peers on agent port
-    if (dst_port != AGENT_PORT || !is_agent_peer(dst_ip))
+    // Only redirect connections to known agent peers on an intercepted port
+    if (!is_agent_port(dst_port) || !is_agent_peer(dst_ip))
         return 1;  // Allow
     
-    // This is an A2A connection to a known peer!
-    // Store original destination before redirecting
-    struct orig_dest_key key = {
-        .src_ip = 0,  // Will be filled after connect, using dst_port as temp key
-        .src_port = 0,
-        .padding = 0,
-    };
-    // Use a simple key based on original destination for now
-    // User-space will need to match this up
-    key.src_ip = dst_ip;
-    key.src_port = dst_port;
-    
-    struct orig_dest dest = {
-        .ip = dst_ip,
-        .port = dst_port,
-        .padding = 0,
-    };
-    bpf_map_update_elem(&orig_dest_map, &key, &dest, BPF_ANY);
-    
-    // Send event to user-space
+    // This is an A2A connection to a known peer. Record the original destination
+    // keyed by the socket cookie so sock_ops can re-key it by source port for
+    // multi-peer routing in user-space.
+    __u64 cookie = bpf_get_socket_cookie(ctx);
+    struct orig_dest d = { .ip = dst_ip, .port = dst_port, ._pad = 0 };
+    bpf_map_update_elem(&cookie_dest, &cookie, &d, BPF_ANY);
+
     send_event(EVENT_CONNECT, 0, dst_ip, 0, dst_port);
-    
+
     // Redirect to local Grimlock listener
     ctx->user_ip4 = LOCALHOST_IP;           // 127.0.0.1
     ctx->user_port = bpf_htons(GRIMLOCK_LOCAL_PORT);  // 15001
-    
-    inc_stat(STAT_CONNECT4_REDIRECT);
-    
+
     return 1;  // Allow (with modified destination)
 }

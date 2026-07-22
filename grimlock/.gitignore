@@ -384,3 +384,10 @@ cmd/splice-test/splice-test
 # OS files
 .DS_Store
 Thumbs.db
+
+# Coq build artifacts
+formal/*.vo
+formal/*.vok
+formal/*.vos
+formal/*.glob
+formal/.*.aux
